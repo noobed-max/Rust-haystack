@@ -1,121 +1,187 @@
-use actix_multipart::Multipart;
-use actix_web::{get, post, web, App, Error, HttpResponse, HttpServer, Responder};
-use futures::{StreamExt, TryStreamExt};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use rusqlite::{params, Connection, Result as SqliteResult};
+use lazy_static::lazy_static;
 use std::sync::Mutex;
+use serde_json::json;
+use actix_web::{web, App, HttpResponse, HttpServer, Error};
+use actix_multipart::Multipart;
+use futures_util::TryStreamExt;
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write, Read};
 
-#[derive(Serialize, Deserialize)]
-struct IndexEntry(u64, u64);
-
-struct SimpleHaystack {
-    storage_file: String,
-    index_file: String,
-    index: Mutex<HashMap<String, IndexEntry>>,
+lazy_static! {
+    static ref DB_CONN: Mutex<Connection> = {
+        let conn = Connection::open("haystack.sqlite").expect("Failed to open the database");
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS haystack (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL,
+                offset INTEGER,
+                size INTEGER
+            )",
+            [],
+        ).expect("Failed to create table");
+        Mutex::new(conn)
+    };
 }
 
-impl SimpleHaystack {
-    fn new(storage_file: String, index_file: Option<String>) -> Self {
-        let index_file = index_file.unwrap_or_else(|| "haystack_index.json".to_string());
-        let index = Mutex::new(Self::load_index(&index_file));
-        SimpleHaystack {
-            storage_file,
-            index_file,
-            index,
-        }
-    }
-
-    fn load_index(index_file: &str) -> HashMap<String, IndexEntry> {
-        if Path::new(index_file).exists() {
-            let file = File::open(index_file).unwrap();
-            serde_json::from_reader(file).unwrap()
-        } else {
-            HashMap::new()
-        }
-    }
-
-    fn add_file(&self, file_name: String, data: &[u8]) {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.storage_file)
-            .unwrap();
-        let offset = file.seek(SeekFrom::End(0)).unwrap();
-        file.write_all(data).unwrap();
-        let size = data.len() as u64;
-        let mut index = self.index.lock().unwrap();
-        index.insert(file_name, IndexEntry(offset, size));
-    }
-
-    fn save_index(&self) {
-        let index = self.index.lock().unwrap();
-        let file = File::create(&self.index_file).unwrap();
-        serde_json::to_writer(file, &*index).unwrap();
-    }
+fn check_key(key: &str) -> SqliteResult<bool> {
+    let conn = DB_CONN.lock().unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM haystack WHERE key = ?1")?;
+    let count: i64 = stmt.query_row(params![key], |row| row.get(0))?;
+    Ok(count > 0)
 }
 
-#[post("/upload/")]
-async fn upload_file(mut payload: Multipart, haystack: web::Data<SimpleHaystack>) -> Result<HttpResponse, Error> {
-    while let Ok(Some(mut field)) = payload.try_next().await {
-        let content_disposition = field.content_disposition().unwrap().clone();
-        
-        if let Some(filename) = content_disposition.get_filename() {
-            let mut data = Vec::new();
-            while let Some(chunk) = field.next().await {
-                data.extend_from_slice(&chunk?);
-            }
-            haystack.add_file(filename.to_string(), &data);
-            haystack.save_index();
-            return Ok(HttpResponse::Ok().json(serde_json::json!({
-                "filename": filename
-            })));
-        }
-    }
-    Ok(HttpResponse::BadRequest().body("Invalid upload"))
+fn upload_sql(key: &str, offset: u64, size: u64) -> SqliteResult<()> {
+    let conn = DB_CONN.lock().unwrap();
+    conn.execute(
+        "INSERT INTO haystack (key, offset, size) VALUES (?1, ?2, ?3)",
+        params![key, offset, size],
+    )?;
+    Ok(())
 }
 
-#[get("/files/{filename}")]
-async fn get_file(filename: web::Path<String>, haystack: web::Data<SimpleHaystack>) -> impl Responder {
-    let index = haystack.index.lock().unwrap();
-    if let Some(IndexEntry(offset, size)) = index.get(filename.as_str()) {
-        let mut file = File::open(&haystack.storage_file).unwrap();
-        file.seek(SeekFrom::Start(*offset)).unwrap();
-        let mut buffer = vec![0; *size as usize];
-        file.read_exact(&mut buffer).unwrap();
-        HttpResponse::Ok()
-            .content_type("application/octet-stream")
-            .append_header((
-                "Content-Disposition",
-                format!("attachment; filename={}", filename)
-            ))
-            .body(buffer)
+fn get_sql(key: &str) -> SqliteResult<(u64, u64)> {
+    let conn = DB_CONN.lock().unwrap();
+    let mut stmt = conn.prepare("SELECT offset, size FROM haystack WHERE key = ?1")?;
+    let (offset, size): (u64, u64) = stmt.query_row(params![key], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    Ok((offset, size))
+}
+
+#[actix_web::post("/upload/{key}")]
+async fn upload_files(key: web::Path<String>, mut payload: Multipart) -> Result<HttpResponse, Error> {
+    let key = key.into_inner();
+    if check_key(&key).map_err(actix_web::error::ErrorInternalServerError)? {
+        return Ok(HttpResponse::BadRequest().body("Key already exists"));
+    }
+
+    let mut storage_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("haystack.bin")
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    if let Ok(Some(mut field)) = payload.try_next().await {
+        let mut file_data = Vec::new();
+        while let Some(chunk) = field.try_next().await? {
+            file_data.extend_from_slice(&chunk);
+        }
+
+        let offset = storage_file.seek(SeekFrom::End(0))
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        storage_file.write_all(&file_data)
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let size = file_data.len() as u64;
+        upload_sql(&key, offset, size)
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(HttpResponse::Ok().body(format!("File uploaded successfully: key = {}", key)))
     } else {
-        HttpResponse::NotFound().body("File not found")
+        Ok(HttpResponse::BadRequest().body("No file was uploaded"))
     }
 }
 
-#[get("/index/")]
-async fn get_index(haystack: web::Data<SimpleHaystack>) -> impl Responder {
-    let index = haystack.index.lock().unwrap();
-    HttpResponse::Ok().json(&*index)
+#[actix_web::get("/get/{key}")]
+async fn retrieve_file(key: web::Path<String>) -> Result<HttpResponse, Error> {
+    let key = key.into_inner();
+    if !check_key(&key).map_err(actix_web::error::ErrorInternalServerError)? {
+        return Ok(HttpResponse::NotFound().body("Key not found"));
+    }
+    let (offset, size) = get_sql(&key)
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let mut file = File::open("haystack.bin")
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let mut buffer = vec![0; size as usize];
+    file.read_exact(&mut buffer)
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .append_header((
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", key),
+        ))
+        .body(buffer))
+}
+
+#[actix_web::put("/update/{key}")]
+async fn update_file(key: web::Path<String>, mut payload: Multipart) -> Result<HttpResponse, Error> {
+    let key = key.into_inner();
+    if !check_key(&key).map_err(actix_web::error::ErrorInternalServerError)? {
+        return Ok(HttpResponse::NotFound().body("Key not found"));
+    }
+    let mut storage_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("haystack.bin")
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    if let Ok(Some(mut field)) = payload.try_next().await {
+        let mut file_data = Vec::new();
+        while let Some(chunk) = field.try_next().await? {
+            file_data.extend_from_slice(&chunk);
+        }
+
+        let offset = storage_file.seek(SeekFrom::End(0))
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        storage_file.write_all(&file_data)
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let size = file_data.len() as u64;
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "UPDATE haystack SET offset = ?1, size = ?2 WHERE key = ?3",
+            params![offset, size, key],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+
+        Ok(HttpResponse::Ok().body(format!("File updated successfully: key = {}", key)))
+    } else {
+        Ok(HttpResponse::BadRequest().body("No file was uploaded"))
+    }
+}
+
+#[actix_web::delete("/delete/{key}")]
+async fn delete_file(key: web::Path<String>) -> Result<HttpResponse, Error> {
+    let key = key.into_inner();
+    if !check_key(&key).map_err(actix_web::error::ErrorInternalServerError)? {
+        return Ok(HttpResponse::NotFound().body("Key not found"));
+    }
+    let (offset, size) = get_sql(&key)
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let mut delete_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("delete.log")
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let log_entry = json!({
+        &key: {
+            "offset": offset,
+            "size": size
+        }
+    });
+    
+    delete_log.seek(SeekFrom::End(0))
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    writeln!(delete_log, "{}", log_entry.to_string())
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    let conn = DB_CONN.lock().unwrap();
+    conn.execute(
+        "DELETE FROM haystack WHERE key = ?1",
+        params![key],
+    ).map_err(actix_web::error::ErrorInternalServerError)?;
+
+    Ok(HttpResponse::Ok().body(format!("File deleted successfully: key = {}", key)))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let haystack = web::Data::new(SimpleHaystack::new(
-        "haystack_storage.bin".to_string(),
-        None,
-    ));
-
-    HttpServer::new(move || {
+    HttpServer::new(|| {
         App::new()
-            .app_data(haystack.clone())
-            .service(upload_file)
-            .service(get_file)
-            .service(get_index)
+            .service(upload_files)
+            .service(retrieve_file)
+            .service(update_file)
+            .service(delete_file)  
     })
     .bind("127.0.0.1:8080")?
     .run()
